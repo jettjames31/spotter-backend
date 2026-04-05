@@ -6,6 +6,7 @@ Endpoints:
   GET  /api/roster/{abbr}      → Get roster for a team (from DB, scraped from official site)
   POST /api/scrape/{abbr}      → Force re-scrape a single team
   POST /api/scrape-all         → Scrape all 32 teams (runs in background)
+  GET  /api/scrape-status      → Check if a scrape is currently running + progress
   GET  /api/health             → Health check
 
 The scraper runs automatically every 6 hours to keep rosters fresh.
@@ -13,6 +14,7 @@ The scraper runs automatically every 6 hours to keep rosters fresh.
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from threading import Thread
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +27,19 @@ from database import init_db, save_roster, get_roster, log_scrape_error, get_all
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ── Scrape State ─────────────────────────────────────────
+
+scrape_state = {
+    "running": False,
+    "started_at": None,
+    "completed": 0,
+    "total": 32,
+    "current_team": "",
+    "errors": [],
+    "finished_at": None,
+}
 
 
 # ── Scrape Jobs ──────────────────────────────────────────
@@ -53,13 +68,30 @@ def scrape_single_team(abbr: str) -> dict:
 
 def scrape_all_teams():
     """Scrape all 32 teams. Called on schedule and on-demand."""
+    global scrape_state
+    scrape_state["running"] = True
+    scrape_state["started_at"] = datetime.now(timezone.utc).isoformat()
+    scrape_state["completed"] = 0
+    scrape_state["total"] = len(TEAMS)
+    scrape_state["errors"] = []
+    scrape_state["finished_at"] = None
+
     logger.info("Starting full scrape of all 32 teams...")
     results = []
-    for abbr in TEAMS:
+    for i, abbr in enumerate(TEAMS):
+        scrape_state["current_team"] = abbr
         result = scrape_single_team(abbr)
         results.append(result)
+        scrape_state["completed"] = i + 1
+        if result["status"] == "error":
+            scrape_state["errors"].append(abbr)
+
     ok = sum(1 for r in results if r["status"] == "ok")
     logger.info(f"Full scrape complete: {ok}/32 teams successful")
+
+    scrape_state["running"] = False
+    scrape_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+    scrape_state["current_team"] = ""
     return results
 
 
@@ -92,11 +124,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Spotter Board API",
     description="Live NFL roster data for broadcast spotter boards",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
-# Allow frontend from any origin (tighten in production)
+# Allow frontend from any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -169,8 +201,30 @@ def force_scrape_team(abbr: str):
 @app.post("/api/scrape-all")
 def force_scrape_all():
     """Trigger a full scrape of all 32 teams (runs in background)."""
+    if scrape_state["running"]:
+        return {
+            "status": "already_running",
+            "message": "A scrape is already in progress",
+            "completed": scrape_state["completed"],
+            "total": scrape_state["total"],
+            "current_team": scrape_state["current_team"],
+        }
     Thread(target=scrape_all_teams, daemon=True).start()
     return {"status": "started", "message": "Scraping all 32 teams in background"}
+
+
+@app.get("/api/scrape-status")
+def get_scrape_status():
+    """Check current scrape progress. Frontend polls this."""
+    return {
+        "running": scrape_state["running"],
+        "completed": scrape_state["completed"],
+        "total": scrape_state["total"],
+        "current_team": scrape_state["current_team"],
+        "started_at": scrape_state["started_at"],
+        "finished_at": scrape_state["finished_at"],
+        "errors": scrape_state["errors"],
+    }
 
 
 # ── Run ──────────────────────────────────────────────────
