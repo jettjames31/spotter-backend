@@ -4,8 +4,10 @@ Scraper for NFL team websites using Selenium + ESPN API enrichment.
 Pipeline:
 1. Official team sites (Selenium) -> roster data, height/weight/age/college
 2. Official team sites (Selenium) -> depth chart for starter info
-3. ESPN JSON API (requests) -> draft info, injuries, previous team
-   No Selenium needed for ESPN! Plain HTTP requests to public API.
+3. ESPN JSON API (requests) -> injuries, status, espn_id from roster endpoint
+4. ESPN JSON API (requests) -> draft info from athlete overview endpoint (RELIABLE)
+   The roster endpoint does NOT return draft info consistently.
+   The overview endpoint at /athletes/{id}/overview always has it.
 """
 
 import logging
@@ -77,6 +79,7 @@ def scrape_roster(url, driver=None):
                 "experience": experience, "college": college,
                 "starter": False, "prevTeam": "", "draft": "",
                 "injury_status": "", "injury_detail": "",
+                "espn_id": "",
             })
         logger.info(f"Scraped {len(players)} players from {url}")
     except Exception as e:
@@ -176,8 +179,34 @@ def normalize_name(name):
     return name
 
 
+def _find_espn_match(norm, espn_data):
+    """Find an ESPN data match by normalized name, with last-name + first-initial fallback."""
+    match = espn_data.get(norm)
+    if match:
+        return match
+    # Fallback: last name + first initial
+    parts = norm.split()
+    if len(parts) >= 2:
+        last = parts[-1]
+        fi = parts[0][0] if parts[0] else ""
+        for en, ed in espn_data.items():
+            ep = en.split()
+            if ep and ep[-1] == last and ep[0] and ep[0][0] == fi:
+                return ed
+    return None
+
+
 def enrich_with_espn_api(players, team_abbr):
-    """Enrich players with draft, injury, prevTeam from ESPN's public JSON API."""
+    """
+    Enrich players from ESPN in two phases:
+
+    Phase 1: ESPN Roster endpoint → injuries, status, espn_id (fast, one request)
+             Draft info from this endpoint is UNRELIABLE — often missing.
+
+    Phase 2: ESPN Athlete Overview endpoint → draft round/pick/year (RELIABLE)
+             Fetches /athletes/{id}/overview for EVERY player that has an espn_id.
+             Also gets prevTeam from draft team comparison.
+    """
     espn_id = ESPN_TEAM_IDS.get(team_abbr)
     if not espn_id:
         logger.warning(f"No ESPN team ID for {team_abbr}")
@@ -186,9 +215,9 @@ def enrich_with_espn_api(players, team_abbr):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     espn_data = {}
 
-    # Step 1: Fetch ESPN roster JSON
+    # ── Phase 1: Roster endpoint (injuries, status, espn_id) ──────────
     try:
-        logger.info(f"Fetching ESPN API roster for {team_abbr} (ID {espn_id})...")
+        logger.info(f"ESPN Phase 1: Fetching roster for {team_abbr} (ID {espn_id})...")
         r = http_requests.get(
             f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{espn_id}/roster",
             timeout=15, headers=headers
@@ -202,16 +231,6 @@ def enrich_with_espn_api(players, team_abbr):
                 if not name:
                     continue
                 norm = normalize_name(name)
-
-                # Draft
-                draft = ""
-                di = athlete.get("draft", {})
-                if di and isinstance(di, dict):
-                    yr = di.get("year", "")
-                    rnd = di.get("round", "")
-                    pick = di.get("selection", "")
-                    if yr and rnd:
-                        draft = f"{yr} R{rnd} P{pick}" if pick else f"{yr} R{rnd}"
 
                 # Injury
                 injury_status = ""
@@ -227,109 +246,159 @@ def enrich_with_espn_api(players, team_abbr):
                 si = athlete.get("status", {})
                 espn_status = si.get("name", "Active") if isinstance(si, dict) else "Active"
 
+                # Draft from roster endpoint (might be empty — that's ok, Phase 2 handles it)
+                draft_from_roster = ""
+                di = athlete.get("draft", {})
+                if di and isinstance(di, dict):
+                    yr = di.get("year", "")
+                    rnd = di.get("round", "")
+                    pick = di.get("selection", "")
+                    if yr and rnd:
+                        draft_from_roster = f"{yr} R{rnd} P{pick}" if pick else f"{yr} R{rnd}"
+
                 espn_data[norm] = {
-                    "draft": draft,
+                    "draft": draft_from_roster,
                     "injury_status": injury_status,
                     "injury_detail": injury_detail,
                     "espn_status": espn_status,
-                    "espn_id": athlete.get("id", ""),
+                    "espn_id": str(athlete.get("id", "")),
                 }
 
-        logger.info(f"ESPN roster: {len(espn_data)} athletes for {team_abbr}")
+        logger.info(f"ESPN Phase 1: {len(espn_data)} athletes mapped for {team_abbr}")
     except Exception as e:
         logger.error(f"ESPN roster fetch failed for {team_abbr}: {e}")
         return players
 
-    # Step 2: Match and merge
-    enriched_draft = 0
+    # Merge Phase 1 data (injuries, status, espn_id) into players
     enriched_injury = 0
-
+    enriched_draft_p1 = 0
     for p in players:
         norm = normalize_name(p["name"])
-        match = espn_data.get(norm)
-
-        # Fallback: last name + first initial
+        match = _find_espn_match(norm, espn_data)
         if not match:
-            parts = norm.split()
-            if len(parts) >= 2:
-                last = parts[-1]
-                fi = parts[0][0] if parts[0] else ""
-                for en, ed in espn_data.items():
-                    ep = en.split()
-                    if ep and ep[-1] == last and ep[0] and ep[0][0] == fi:
-                        match = ed
-                        break
+            continue
 
-        if match:
-            if match["draft"] and not p.get("draft"):
-                p["draft"] = match["draft"]
-                enriched_draft += 1
-            if match["injury_status"]:
-                p["injury_status"] = match["injury_status"]
-                p["injury_detail"] = match.get("injury_detail", "")
-                enriched_injury += 1
-            es = match.get("espn_status", "")
-            if es and es.lower() != "active":
-                if "injured" in es.lower():
-                    p["status"] = "IR"
-                elif "practice" in es.lower():
-                    p["status"] = "Practice Squad"
+        # Always set espn_id
+        if match.get("espn_id"):
+            p["espn_id"] = match["espn_id"]
 
-    logger.info(f"ESPN enrichment for {team_abbr}: {enriched_draft} draft, {enriched_injury} injuries")
+        # Injuries (from roster endpoint — this works reliably)
+        if match["injury_status"]:
+            p["injury_status"] = match["injury_status"]
+            p["injury_detail"] = match.get("injury_detail", "")
+            enriched_injury += 1
 
-    # Step 3: Individual athlete lookups for remaining draft info + prevTeam
-    missing = [p for p in players if not p.get("draft")]
-    if missing:
-        logger.info(f"Fetching individual athlete details for {min(len(missing), 30)} players...")
-        fetched = 0
-        for p in missing[:30]:
-            norm = normalize_name(p["name"])
-            match = espn_data.get(norm)
-            if not match:
-                parts = norm.split()
-                if len(parts) >= 2:
-                    last = parts[-1]
-                    fi = parts[0][0] if parts[0] else ""
-                    for en, ed in espn_data.items():
-                        ep = en.split()
-                        if ep and ep[-1] == last and ep[0] and ep[0][0] == fi:
-                            match = ed
-                            break
-            if not match or not match.get("espn_id"):
-                continue
-            aid = match["espn_id"]
-            try:
-                ar = http_requests.get(
-                    f"https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/{aid}/overview",
-                    timeout=10, headers=headers
-                )
-                if ar.status_code == 200:
-                    ad = ar.json()
-                    bio = ad.get("athlete", {})
-                    di = bio.get("draft", {})
-                    if di and isinstance(di, dict):
-                        yr = di.get("year", "")
-                        rnd = di.get("round", "")
-                        pick = di.get("selection", "")
-                        if yr and rnd:
-                            p["draft"] = f"{yr} R{rnd} P{pick}" if pick else f"{yr} R{rnd}"
-                            fetched += 1
-                        # prevTeam from draft team
-                        dt = di.get("team", {})
-                        dtid = dt.get("id") if isinstance(dt, dict) else None
-                        if dtid:
-                            try:
-                                dtid = int(dtid)
-                            except (ValueError, TypeError):
-                                dtid = None
-                            if dtid and dtid != espn_id:
-                                orig = ESPN_TEAM_NAMES.get(dtid, "")
-                                if orig and not p.get("prevTeam"):
-                                    p["prevTeam"] = orig
-                time.sleep(0.3)
-            except Exception:
-                continue
-        logger.info(f"Individual lookups: {fetched} additional draft records")
+        # Draft from roster endpoint (unreliable but use it if we got it)
+        if match["draft"] and not p.get("draft"):
+            p["draft"] = match["draft"]
+            enriched_draft_p1 += 1
+
+        # ESPN status
+        es = match.get("espn_status", "")
+        if es and es.lower() != "active":
+            if "injured" in es.lower():
+                p["status"] = "IR"
+            elif "practice" in es.lower():
+                p["status"] = "Practice Squad"
+
+    logger.info(f"ESPN Phase 1 merge: {enriched_injury} injuries, {enriched_draft_p1} draft (from roster)")
+
+    # ── Phase 2: Athlete Overview endpoint (draft info — RELIABLE) ────
+    # Fetch overview for ALL players with an espn_id that still need draft info.
+    # Also fetch for players who got draft from Phase 1 to get prevTeam.
+    players_to_fetch = [p for p in players if p.get("espn_id")]
+    if not players_to_fetch:
+        logger.info(f"ESPN Phase 2: No ESPN IDs to look up for {team_abbr}")
+        return players
+
+    logger.info(f"ESPN Phase 2: Fetching athlete overview for {len(players_to_fetch)} players on {team_abbr}...")
+    enriched_draft_p2 = 0
+    enriched_prev = 0
+    errors = 0
+
+    for i, p in enumerate(players_to_fetch):
+        aid = p["espn_id"]
+        if not aid:
+            continue
+
+        try:
+            ar = http_requests.get(
+                f"https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/{aid}/overview",
+                timeout=10, headers=headers
+            )
+            if ar.status_code == 200:
+                ad = ar.json()
+                bio = ad.get("athlete", {})
+
+                # ─── Draft info (the main goal) ───
+                di = bio.get("draft", {})
+                if di and isinstance(di, dict):
+                    yr = di.get("year", "")
+                    rnd = di.get("round", "")
+                    pick = di.get("selection", "")
+                    if yr and rnd:
+                        draft_str = f"{yr} R{rnd} P{pick}" if pick else f"{yr} R{rnd}"
+                        # Always overwrite with overview data (more reliable)
+                        if not p.get("draft") or p["draft"] != draft_str:
+                            p["draft"] = draft_str
+                            enriched_draft_p2 += 1
+
+                    # ─── prevTeam from draft team comparison ───
+                    dt = di.get("team", {})
+                    if isinstance(dt, dict):
+                        dtid = dt.get("id")
+                        try:
+                            dtid = int(dtid) if dtid else None
+                        except (ValueError, TypeError):
+                            dtid = None
+                        if dtid and dtid != espn_id and not p.get("prevTeam"):
+                            orig = ESPN_TEAM_NAMES.get(dtid, "")
+                            if orig:
+                                p["prevTeam"] = orig
+                                enriched_prev += 1
+
+                # ─── If no draft object, mark as UDFA ───
+                if not p.get("draft") and not di:
+                    p["draft"] = "UDFA"
+                    enriched_draft_p2 += 1
+
+            elif ar.status_code == 404:
+                # Player not found on ESPN — likely practice squad/new
+                pass
+            else:
+                errors += 1
+
+            # Rate limit: 0.25s between requests (~4 req/sec)
+            # For a 53-man roster this is ~13 seconds total
+            time.sleep(0.25)
+
+        except http_requests.exceptions.Timeout:
+            errors += 1
+            logger.warning(f"Timeout fetching overview for {p['name']} (ESPN ID {aid})")
+            time.sleep(0.5)
+            continue
+        except Exception as e:
+            errors += 1
+            logger.warning(f"Error fetching overview for {p['name']}: {e}")
+            continue
+
+        # Log progress every 20 players
+        if (i + 1) % 20 == 0:
+            logger.info(f"ESPN Phase 2 progress: {i + 1}/{len(players_to_fetch)} athletes fetched")
+
+    logger.info(
+        f"ESPN Phase 2 complete for {team_abbr}: "
+        f"{enriched_draft_p2} draft records, {enriched_prev} prevTeam, {errors} errors"
+    )
+
+    # Final summary
+    total_with_draft = sum(1 for p in players if p.get("draft"))
+    total_with_injury = sum(1 for p in players if p.get("injury_status"))
+    logger.info(
+        f"ESPN enrichment totals for {team_abbr}: "
+        f"{total_with_draft}/{len(players)} have draft info, "
+        f"{total_with_injury}/{len(players)} have injury info"
+    )
 
     return players
 
@@ -349,7 +418,7 @@ def scrape_team(roster_url, depth_chart_url, team_abbr=""):
     finally:
         driver.quit()
 
-    # ESPN enrichment - no Selenium needed
+    # ESPN enrichment — no Selenium needed, plain HTTP
     if team_abbr:
         players = enrich_with_espn_api(players, team_abbr)
 
