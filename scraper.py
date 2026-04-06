@@ -5,9 +5,10 @@ Pipeline:
 1. Official team sites (Selenium) -> roster data, height/weight/age/college
 2. Official team sites (Selenium) -> depth chart for starter info
 3. ESPN JSON API (requests) -> injuries, status, espn_id from roster endpoint
-4. ESPN JSON API (requests) -> draft info from athlete overview endpoint (RELIABLE)
-   The roster endpoint does NOT return draft info consistently.
-   The overview endpoint at /athletes/{id}/overview always has it.
+4. ESPN JSON API (requests) -> draft info from core athlete endpoint (RELIABLE)
+   The roster endpoint does NOT return draft info.
+   The overview endpoint returns draft as a $ref link (useless).
+   The core API at sports.core.api.espn.com/v2/.../athletes/{id} returns it inline.
 """
 
 import logging
@@ -303,15 +304,16 @@ def enrich_with_espn_api(players, team_abbr):
 
     logger.info(f"ESPN Phase 1 merge: {enriched_injury} injuries, {enriched_draft_p1} draft (from roster)")
 
-    # ── Phase 2: Athlete Overview endpoint (draft info — RELIABLE) ────
-    # Fetch overview for ALL players with an espn_id that still need draft info.
-    # Also fetch for players who got draft from Phase 1 to get prevTeam.
-    players_to_fetch = [p for p in players if p.get("espn_id")]
+    # ── Phase 2: Core Athlete endpoint (draft info — RELIABLE) ─────────
+    # The overview endpoint returns draft as a $ref link, not inline data.
+    # The core API at sports.core.api.espn.com returns draft data inline.
+    # Fetch for ALL players with an espn_id to get draft round/pick/year.
+    players_to_fetch = [p for p in players if p.get("espn_id") and not p.get("draft")]
     if not players_to_fetch:
-        logger.info(f"ESPN Phase 2: No ESPN IDs to look up for {team_abbr}")
+        logger.info(f"ESPN Phase 2: No players need draft lookup for {team_abbr}")
         return players
 
-    logger.info(f"ESPN Phase 2: Fetching athlete overview for {len(players_to_fetch)} players on {team_abbr}...")
+    logger.info(f"ESPN Phase 2: Fetching core athlete data for {len(players_to_fetch)} players on {team_abbr}...")
     enriched_draft_p2 = 0
     enriched_prev = 0
     errors = 0
@@ -322,30 +324,31 @@ def enrich_with_espn_api(players, team_abbr):
             continue
 
         try:
+            # Use core API — returns draft info inline (not as $ref)
             ar = http_requests.get(
-                f"https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/{aid}/overview",
+                f"https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/{aid}",
                 timeout=10, headers=headers
             )
             if ar.status_code == 200:
                 ad = ar.json()
-                bio = ad.get("athlete", {})
 
                 # ─── Draft info (the main goal) ───
-                di = bio.get("draft", {})
-                if di and isinstance(di, dict):
+                # Core API nests draft under athlete.draft directly
+                di = ad.get("draft", {})
+
+                # Skip if it's a $ref link instead of real data
+                if di and isinstance(di, dict) and "$ref" not in di:
                     yr = di.get("year", "")
                     rnd = di.get("round", "")
-                    pick = di.get("selection", "")
+                    pick = di.get("selection", "") or di.get("pick", "")
                     if yr and rnd:
                         draft_str = f"{yr} R{rnd} P{pick}" if pick else f"{yr} R{rnd}"
-                        # Always overwrite with overview data (more reliable)
-                        if not p.get("draft") or p["draft"] != draft_str:
-                            p["draft"] = draft_str
-                            enriched_draft_p2 += 1
+                        p["draft"] = draft_str
+                        enriched_draft_p2 += 1
 
                     # ─── prevTeam from draft team comparison ───
                     dt = di.get("team", {})
-                    if isinstance(dt, dict):
+                    if isinstance(dt, dict) and "$ref" not in dt:
                         dtid = dt.get("id")
                         try:
                             dtid = int(dtid) if dtid else None
@@ -357,10 +360,17 @@ def enrich_with_espn_api(players, team_abbr):
                                 p["prevTeam"] = orig
                                 enriched_prev += 1
 
-                # ─── If no draft object, mark as UDFA ───
-                if not p.get("draft") and not di:
-                    p["draft"] = "UDFA"
-                    enriched_draft_p2 += 1
+                # ─── If no draft data found at all, mark UDFA ───
+                if not p.get("draft"):
+                    # Check if draft key is missing entirely or is a $ref
+                    has_real_draft = (
+                        di and isinstance(di, dict)
+                        and "$ref" not in di
+                        and di.get("year")
+                    )
+                    if not has_real_draft:
+                        p["draft"] = "UDFA"
+                        enriched_draft_p2 += 1
 
             elif ar.status_code == 404:
                 # Player not found on ESPN — likely practice squad/new
@@ -374,12 +384,12 @@ def enrich_with_espn_api(players, team_abbr):
 
         except http_requests.exceptions.Timeout:
             errors += 1
-            logger.warning(f"Timeout fetching overview for {p['name']} (ESPN ID {aid})")
+            logger.warning(f"Timeout fetching athlete data for {p['name']} (ESPN ID {aid})")
             time.sleep(0.5)
             continue
         except Exception as e:
             errors += 1
-            logger.warning(f"Error fetching overview for {p['name']}: {e}")
+            logger.warning(f"Error fetching athlete data for {p['name']}: {e}")
             continue
 
         # Log progress every 20 players
