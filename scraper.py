@@ -348,17 +348,23 @@ def enrich_with_espn_api(players, team_abbr):
 
                     # ─── prevTeam from draft team comparison ───
                     dt = di.get("team", {})
-                    if isinstance(dt, dict) and "$ref" not in dt:
-                        dtid = dt.get("id")
-                        try:
-                            dtid = int(dtid) if dtid else None
-                        except (ValueError, TypeError):
-                            dtid = None
-                        if dtid and dtid != espn_id and not p.get("prevTeam"):
-                            orig = ESPN_TEAM_NAMES.get(dtid, "")
-                            if orig:
-                                p["prevTeam"] = orig
-                                enriched_prev += 1
+                    dtid = None
+                    if isinstance(dt, dict):
+                        if "$ref" in dt:
+                            # Extract team ID from $ref URL like ".../teams/12?..."
+                            ref_match = re.search(r'/teams/(\d+)', dt["$ref"])
+                            if ref_match:
+                                dtid = int(ref_match.group(1))
+                        else:
+                            try:
+                                dtid = int(dt.get("id")) if dt.get("id") else None
+                            except (ValueError, TypeError):
+                                dtid = None
+                    if dtid and dtid != espn_id and not p.get("prevTeam"):
+                        orig = ESPN_TEAM_NAMES.get(dtid, "")
+                        if orig:
+                            p["prevTeam"] = orig
+                            enriched_prev += 1
 
                 # ─── If no draft data found at all, mark UDFA ───
                 if not p.get("draft"):
