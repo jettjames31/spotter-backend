@@ -4,6 +4,8 @@ Spotter Board API
 Endpoints:
   GET  /api/teams              → List all 32 teams with colors and scrape status
   GET  /api/roster/{abbr}      → Get roster for a team (from DB, scraped from official site)
+  GET  /api/stats/{abbr}       → ESPN team statistics (proxied through backend)
+  GET  /api/coaches/{abbr}     → ESPN coaching staff (proxied through backend)
   POST /api/scrape/{abbr}      → Force re-scrape a single team
   POST /api/scrape-all         → Scrape all 32 teams (runs in background)
   GET  /api/scrape-status      → Check if a scrape is currently running + progress
@@ -17,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from threading import Thread
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -225,6 +228,46 @@ def get_scrape_status():
         "finished_at": scrape_state["finished_at"],
         "errors": scrape_state["errors"],
     }
+
+
+# ── ESPN Proxy Endpoints ─────────────────────────────────
+# These proxy ESPN's API through the backend to avoid CORS issues
+# in the browser. The frontend calls these instead of ESPN directly.
+
+ESPN_IDS = {
+    "ARI":22,"ATL":1,"BAL":33,"BUF":2,"CAR":29,"CHI":3,"CIN":4,"CLE":5,
+    "DAL":6,"DEN":7,"DET":8,"GB":9,"HOU":34,"IND":11,"JAX":30,"KC":12,
+    "LAC":24,"LAR":14,"LV":13,"MIA":15,"MIN":16,"NE":17,"NO":18,"NYG":19,
+    "NYJ":20,"PHI":21,"PIT":23,"SEA":26,"SF":25,"TB":27,"TEN":10,"WSH":28,
+}
+
+
+@app.get("/api/stats/{abbr}")
+async def get_stats(abbr: str):
+    """Proxy ESPN team statistics API."""
+    tid = ESPN_IDS.get(abbr.upper())
+    if not tid:
+        raise HTTPException(404, f"Unknown team: {abbr}")
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/statistics",
+            timeout=15
+        )
+        return r.json()
+
+
+@app.get("/api/coaches/{abbr}")
+async def get_coaches(abbr: str):
+    """Proxy ESPN coaches API."""
+    tid = ESPN_IDS.get(abbr.upper())
+    if not tid:
+        raise HTTPException(404, f"Unknown team: {abbr}")
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/coaches",
+            timeout=15
+        )
+        return r.json()
 
 
 # ── Run ──────────────────────────────────────────────────
